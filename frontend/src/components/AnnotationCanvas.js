@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { fabric } from 'fabric';
+import { Canvas, Rect, Circle, Line, FabricImage, PencilBrush } from 'fabric';
 
 const issues = [
   { name: 'Inflamed / Red gums', color: '#800080', recommendation: 'Scaling.' },
@@ -10,15 +10,16 @@ const issues = [
   { name: 'Crowns', color: '#FF00FF', recommendation: 'If the crown is loose or broken, better get it checked. Tooth coloured caps are the best ones.' },
 ];
 
-const AnnotationCanvas = ({ 
-  imageUrl, 
-  annotations, 
-  onSave, 
-  saveButtonText = 'Save Annotations', 
-  isSaveDisabled = false 
+const AnnotationCanvas = ({
+  imageUrl,
+  annotations,
+  onSave,
+  saveButtonText = 'Save Annotations',
+  isSaveDisabled = false
 }) => {
   const canvasRef = useRef(null);
   const [canvas, setCanvas] = useState(null);
+  const [canvasDimensions, setCanvasDimensions] = useState({ width: 400, height: 300 });
   const [tool, setTool] = useState('rect');
   const [selectedIssue, setSelectedIssue] = useState(issues[0]);
   const [isSaving, setIsSaving] = useState(false);
@@ -38,24 +39,23 @@ const AnnotationCanvas = ({
 
     const initCanvas = () => {
       try {
-        const options = {
-          isDrawingMode: false,
-          width: 400,
-          height: 300,
-          backgroundColor: '#f0f0f0',
-          preserveObjectStacking: true,
+        // Ensure canvas element exists
+        if (!canvasRef.current) {
+          throw new Error('Canvas element not found');
+        }
+
+        // In Fabric.js v6, Canvas constructor expects the element directly
+        const newCanvas = new Canvas(canvasRef.current, {
+          width: canvasDimensions.width,
+          height: canvasDimensions.height,
           selection: false,
-          renderOnAddRemove: true,
-          enableRetinaScaling: true,
-        };
-        
-        const newCanvas = new fabric.Canvas(canvasRef.current, options);
-        
+        });
+
         // Verify canvas is properly initialized
-        if (!newCanvas || !newCanvas.lowerCanvasEl) {
+        if (!newCanvas) {
           throw new Error('Failed to initialize canvas element');
         }
-        
+
         return newCanvas;
       } catch (err) {
         console.error('Canvas initialization failed:', err);
@@ -66,209 +66,131 @@ const AnnotationCanvas = ({
 
     const loadImage = async (url, canvas) => {
       // Double-check canvas is still valid
-      if (!canvas || !canvas.lowerCanvasEl || !canvas.lowerCanvasEl.getContext) {
+      if (!canvas) {
         console.error('Canvas not properly initialized for image loading');
         return false;
       }
 
+      if (!url) {
+        console.error('No image URL provided');
+        return false;
+      }
+
       try {
-        // First, load the image to get its dimensions
-        const img = await new Promise((resolve, reject) => {
-          if (!url) {
-            reject(new Error('No image URL provided'));
-            return;
-          }
-          
-          const img = new Image();
-          // Add timestamp to prevent caching issues
-          const timestamp = new Date().getTime();
-          const urlWithCacheBust = url.includes('?') 
-            ? `${url}&t=${timestamp}` 
-            : `${url}?t=${timestamp}`;
-            
-          img.crossOrigin = 'Anonymous';
-          
-          const timeout = setTimeout(() => {
-            reject(new Error('Image loading timed out after 30 seconds'));
-          }, 30000); // 30 second timeout
-          
-          img.onload = () => {
-            clearTimeout(timeout);
-            resolve(img);
-          };
-          
-          img.onerror = (e) => {
-            clearTimeout(timeout);
-            const error = new Error(`Failed to load image from ${url}. Please check:
-            1. The URL is correct and accessible
-            2. CORS is properly configured on the server
-            3. The image exists and is publicly accessible`);
-            error.event = e;
-            console.error('Image load error:', error);
-            reject(error);
-          };
-          
-          // Set src after all handlers are attached
-          img.src = urlWithCacheBust;
-          
-          // src is now set after all handlers are attached
+        // Add timestamp to bypass cache and avoid CORS issues with cached non-CORS responses
+        const timestampUrl = `${url}${url.includes('?') ? '&' : '?'}t=${Date.now()}`;
+        console.log('Loading image via FabricImage.fromURL:', timestampUrl);
+
+        // Use Fabric's built-in async loader
+        const fabricImg = await FabricImage.fromURL(timestampUrl, {
+          crossOrigin: 'anonymous'
         });
 
-        // Check canvas is still valid after image load
-        if (!canvas || !canvas.lowerCanvasEl || !canvas.lowerCanvasEl.getContext) {
-          console.log('Canvas was unmounted during image loading');
+        // Calculate dimensions to fit width 400 while maintaining aspect ratio
+        const aspectRatio = fabricImg.height / fabricImg.width;
+        const newHeight = 400 * aspectRatio;
+
+        // If dimensions need to change, update state and abort loading
+        // The component will re-render with new dimensions, and we'll load the image again
+        if (Math.abs(canvasDimensions.height - newHeight) > 1) {
+          console.log(`Adjusting canvas height from ${canvasDimensions.height} to ${newHeight}`);
+          setCanvasDimensions({ width: 400, height: newHeight });
           return false;
         }
 
-        // Create a new canvas for the background
-        const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = 400;
-        tempCanvas.height = 300;
-        const ctx = tempCanvas.getContext('2d');
-        
-        if (!ctx) {
-          throw new Error('Could not get 2D context for temporary canvas');
-        }
-        
-        // Calculate dimensions to maintain aspect ratio
-        const scale = Math.min(400 / img.width, 300 / img.height);
-        const newWidth = img.width * scale;
-        const newHeight = img.height * scale;
-        const offsetX = (400 - newWidth) / 2;
-        const offsetY = (300 - newHeight) / 2;
-        
-        // Draw the image on the temp canvas
-        ctx.fillStyle = '#f0f0f0';
-        ctx.fillRect(0, 0, 400, 300);
-        
-        // Only draw the image if it's valid
-        if (img.complete && img.naturalWidth !== 0) {
-          ctx.drawImage(img, offsetX, offsetY, newWidth, newHeight);
-        } else {
-          console.warn('Image not fully loaded, drawing placeholder');
-          ctx.fillStyle = '#e0e0e0';
-          ctx.fillRect(offsetX, offsetY, newWidth, newHeight);
-        }
-        
-        // Convert to data URL and set as background
-        const dataUrl = tempCanvas.toDataURL('image/png');
-        
-        return new Promise((resolve) => {
-          // Check canvas is still valid before setting background
-          if (!canvas || !canvas.lowerCanvasEl || !canvas.lowerCanvasEl.getContext) {
-            console.error('Canvas no longer available for setting background');
-            resolve(false);
-            return;
-          }
-          
-          fabric.Image.fromURL(dataUrl, (fabricImg) => {
-            if (!fabricImg || !canvas || !canvas.lowerCanvasEl) {
-              console.error('Failed to create fabric image or canvas is gone');
-              resolve(false);
-              return;
-            }
-            
-            try {
-              // Set the background image with error handling
-              canvas.setBackgroundImage(fabricImg, () => {
-                try {
-                  if (canvas && canvas.renderAll) {
-                    canvas.renderAll();
-                    resolve(true);
-                  } else {
-                    resolve(false);
-                  }
-                } catch (renderErr) {
-                  console.error('Error rendering canvas:', renderErr);
-                  resolve(false);
-                }
-              }, {
-                originX: 'left',
-                originY: 'top',
-                crossOrigin: 'anonymous',
-                imageSmoothingEnabled: false
-              });
-            } catch (setBgErr) {
-              console.error('Error setting background image:', setBgErr);
-              resolve(false);
-            }
-          }, {
-            crossOrigin: 'anonymous'
-          });
+        // Scale image to fit canvas width exactly
+        fabricImg.scaleToWidth(400);
+
+        // Position at 0,0
+        fabricImg.set({
+          left: 0,
+          top: 0,
+          selectable: false,
+          evented: false,
+          hasControls: false,
+          hasBorders: false,
+          lockMovementX: true,
+          lockMovementY: true,
         });
+
+        console.log('Image properties:', {
+          visible: fabricImg.visible,
+          opacity: fabricImg.opacity,
+          width: fabricImg.width,
+          height: fabricImg.height,
+          left: fabricImg.left,
+          top: fabricImg.top,
+          scaleX: fabricImg.scaleX,
+          scaleY: fabricImg.scaleY
+        });
+
+        // Add image as an object
+        canvas.add(fabricImg);
+        // canvas.sendObjectToBack(fabricImg); // Temporarily disable to ensure it's on top
+
+        // Store reference to background image if needed later
+        canvas.backgroundImageObject = fabricImg;
+
+        canvas.renderAll(); // Force synchronous render
+
+        console.log('Image loaded and rendered. Canvas objects:', canvas.getObjects().length);
+        return true;
+
       } catch (err) {
         console.error('Image loading failed:', err);
-        setError(err.message || 'Failed to load image');
+        setError('Failed to load image');
         return false;
       }
     };
 
+
     let isMounted = true;
     let fabricCanvas = null;
     let loadPromise = Promise.resolve();
-    let cleanupTimeout = null;
+
+    // Function to safely clean up canvas
+    const cleanupCanvas = (canvasInstance) => {
+      if (!canvasInstance) return;
+
+      try {
+        // Dispose the canvas - this is critical for Fabric.js v6
+        if (typeof canvasInstance.dispose === 'function') {
+          canvasInstance.dispose().catch(e => console.warn('Dispose error:', e));
+        }
+      } catch (err) {
+        console.error('Error during canvas cleanup:', err);
+      }
+    };
 
     // Initialize canvas
     try {
+      // If canvas element is missing or already has classes, we might have a problem
+      // But let's trust dispose() to have cleaned up, or React to have replaced it
+      if (!canvasRef.current) {
+        return () => { isMounted = false; };
+      }
+
       fabricCanvas = initCanvas();
       if (!fabricCanvas) {
         console.error('Failed to initialize canvas');
-        return;
+        return () => {
+          isMounted = false;
+        };
       }
     } catch (err) {
       console.error('Error initializing canvas:', err);
       setError('Failed to initialize canvas. Please refresh the page.');
-      return;
+      return () => {
+        isMounted = false;
+      };
     }
-
-    // Function to safely clean up canvas
-    const cleanupCanvas = () => {
-      try {
-        // Remove all event listeners first
-        if (typeof fabricCanvas.off === 'function') {
-          fabricCanvas.off();
-        }
-        
-        // Clear any pending renders
-        if (typeof fabricCanvas.cancelRequestedRender === 'function') {
-          fabricCanvas.cancelRequestedRender();
-        }
-        
-        // Clear all objects if possible
-        if (typeof fabricCanvas.clear === 'function') {
-          try {
-            fabricCanvas.clear();
-          } catch (clearErr) {
-            console.warn('Error clearing canvas:', clearErr);
-          }
-        }
-        
-        // Store references to canvas elements before disposal
-        const lowerCanvasEl = fabricCanvas.lowerCanvasEl;
-        const upperCanvasEl = fabricCanvas.upperCanvasEl;
-        const wrapperEl = fabricCanvas.wrapperEl;
-        
-        // Safely dispose of the canvas
-        if (typeof fabricCanvas.dispose === 'function') {
-          try {
-            fabricCanvas.dispose();
-          } catch (disposeErr) {
-            console.warn('Error disposing canvas:', disposeErr);
-          }
-        }
-      } catch (err) {
-        console.error('Error during canvas cleanup:', err);
-      } finally {
-        setCanvas(null);
-      }
-    };
 
     // Load image if URL is provided
     if (imageUrl) {
       loadPromise = loadImage(imageUrl, fabricCanvas)
         .then((success) => {
           if (!isMounted || !fabricCanvas) return false;
-          
+
           if (success) {
             setCanvas(fabricCanvas);
             return true;
@@ -293,16 +215,18 @@ const AnnotationCanvas = ({
       }
     });
 
-    // Cleanup function for when component unmounts
+    // Cleanup function - MUST be synchronous for React StrictMode
     return () => {
       isMounted = false;
-      
-      // Use a timeout to ensure any pending operations complete before cleanup
-      cleanupTimeout = setTimeout(() => {
-        cleanupCanvas();
-      }, 100);
+      setCanvas(null);
+
+      // Synchronously clean up the canvas
+      if (fabricCanvas) {
+        cleanupCanvas(fabricCanvas);
+        fabricCanvas = null;
+      }
     };
-  }, [imageUrl]);
+  }, [imageUrl, canvasDimensions]);
 
   // Handle drawing
   useEffect(() => {
@@ -310,15 +234,19 @@ const AnnotationCanvas = ({
 
     const handleMouseDown = (e) => {
       if (e.e.button === 2) return; // Ignore right click
-      
+
       const pointer = canvas.getPointer(e.e);
       drawingState.current.isDrawing = true;
       drawingState.current.startPos = pointer;
 
       if (tool === 'freehand') {
-        canvas.isDrawingMode = true;
+        // In Fabric.js v6, we need to create a PencilBrush instance
+        if (!canvas.freeDrawingBrush) {
+          canvas.freeDrawingBrush = new PencilBrush(canvas);
+        }
         canvas.freeDrawingBrush.color = selectedIssue.color;
         canvas.freeDrawingBrush.width = 2;
+        canvas.isDrawingMode = true;
         return;
       }
 
@@ -327,7 +255,7 @@ const AnnotationCanvas = ({
 
       switch (tool) {
         case 'rect':
-          shape = new fabric.Rect({
+          shape = new Rect({
             left: pointer.x,
             top: pointer.y,
             width: 1,
@@ -340,7 +268,7 @@ const AnnotationCanvas = ({
           });
           break;
         case 'circle':
-          shape = new fabric.Circle({
+          shape = new Circle({
             left: pointer.x,
             top: pointer.y,
             radius: 1,
@@ -352,7 +280,7 @@ const AnnotationCanvas = ({
           });
           break;
         case 'arrow':
-          shape = new fabric.Line(
+          shape = new Line(
             [pointer.x, pointer.y, pointer.x, pointer.y],
             {
               stroke: selectedIssue.color,
@@ -372,7 +300,7 @@ const AnnotationCanvas = ({
 
     const handleMouseMove = (e) => {
       if (!drawingState.current.isDrawing || !drawingState.current.currentShape) return;
-      
+
       const pointer = canvas.getPointer(e.e);
       const { startPos, currentShape } = drawingState.current;
 
@@ -385,7 +313,7 @@ const AnnotationCanvas = ({
         });
       } else if (tool === 'circle') {
         const radius = Math.sqrt(
-          Math.pow(pointer.x - startPos.x, 2) + 
+          Math.pow(pointer.x - startPos.x, 2) +
           Math.pow(pointer.y - startPos.y, 2)
         ) / 2;
         currentShape.set({
@@ -406,7 +334,8 @@ const AnnotationCanvas = ({
     const handleMouseUp = () => {
       if (drawingState.current.isDrawing) {
         if (tool === 'freehand') {
-          canvas.isDrawingMode = false;
+          // Don't turn off isDrawingMode here - let path:created handle it
+          // canvas.isDrawingMode will stay true until we change tools
         } else if (drawingState.current.currentShape) {
           // Make the shape selectable and add it to the canvas's object list
           const shape = drawingState.current.currentShape;
@@ -422,71 +351,221 @@ const AnnotationCanvas = ({
               issue: selectedIssue
             }
           });
-          
+
           // Force the canvas to update
           canvas.renderAll();
         }
       }
-      
+
       drawingState.current.isDrawing = false;
       drawingState.current.currentShape = null;
+    };
+
+    // Handle freehand drawings when they are completed
+    const handlePathCreated = (e) => {
+      if (e.path) {
+        // Add metadata to the freehand path
+        e.path.set({
+          selectable: true,
+          evented: true,
+          hasControls: true,
+          hasBorders: true,
+          lockRotation: true,
+          lockScalingFlip: true,
+          data: {
+            issue: selectedIssue
+          }
+        });
+        canvas.renderAll();
+      }
     };
 
     canvas.on('mouse:down', handleMouseDown);
     canvas.on('mouse:move', handleMouseMove);
     canvas.on('mouse:up', handleMouseUp);
+    canvas.on('path:created', handlePathCreated);
 
     return () => {
       canvas.off('mouse:down', handleMouseDown);
       canvas.off('mouse:move', handleMouseMove);
       canvas.off('mouse:up', handleMouseUp);
+      canvas.off('path:created', handlePathCreated);
     };
   }, [canvas, tool, selectedIssue]);
 
-  const compressImage = (canvas) => {
-    return new Promise((resolve) => {
+  const compressImage = async (canvas) => {
+    return new Promise(async (resolve) => {
       try {
-        if (!canvas || !canvas.lowerCanvasEl) {
+        if (!canvas) {
           console.error('Canvas is not available for compression');
           resolve(null);
           return;
         }
 
-        // Create a temporary canvas for compression
+        console.log('Creating temporary canvas for export...');
         const tempCanvas = document.createElement('canvas');
-        tempCanvas.width = canvas.width || 400;
-        tempCanvas.height = canvas.height || 300;
-        
+        tempCanvas.width = canvas.getWidth ? canvas.getWidth() : 400;
+        tempCanvas.height = canvas.getHeight ? canvas.getHeight() : 300;
         const ctx = tempCanvas.getContext('2d');
+
         if (!ctx) {
-          console.error('Could not get 2D context for compression');
+          console.error('Could not get 2D context');
           resolve(null);
           return;
         }
-        
-        // Set white background
+
+        // Fill with white background first
         ctx.fillStyle = 'white';
         ctx.fillRect(0, 0, tempCanvas.width, tempCanvas.height);
-        
-        // Draw the canvas content
-        ctx.drawImage(canvas.lowerCanvasEl, 0, 0, tempCanvas.width, tempCanvas.height);
-        
-        // Convert to JPEG with compression
+
+        // First try to use the already-loaded background image from the canvas
+        // This is faster and doesn't require CORS
+        let backgroundDrawn = false;
+        if (canvas.backgroundImage && canvas.backgroundImage._element) {
+          try {
+            console.log('Using already-loaded background image from canvas...');
+            const bgImg = canvas.backgroundImage;
+            const scale = bgImg.scaleX || 1;
+            const scaledWidth = bgImg.width * scale;
+            const scaledHeight = bgImg.height * scale;
+            const left = bgImg.left || 0;
+            const top = bgImg.top || 0;
+
+            ctx.drawImage(bgImg._element, left, top, scaledWidth, scaledHeight);
+            console.log('✓ Background image drawn from canvas successfully!');
+            backgroundDrawn = true;
+          } catch (canvasImgErr) {
+            console.warn('Could not use canvas background image:', canvasImgErr);
+          }
+        }
+
+        // If we couldn't use the canvas background, try reloading with CORS as fallback
+        if (!backgroundDrawn && imageUrl) {
+          try {
+            console.log('Canvas background not available, reloading with CORS...', imageUrl);
+            const bgImage = await new Promise((resolveImg, rejectImg) => {
+              const img = new Image();
+              img.crossOrigin = 'anonymous';
+
+              const timeout = setTimeout(() => {
+                console.error('Background image load TIMED OUT after 30 seconds for:', imageUrl);
+                resolveImg(null);
+              }, 30000); // Increased to 30 seconds
+
+              img.onload = () => {
+                clearTimeout(timeout);
+                console.log('Background image loaded successfully!', {
+                  width: img.width,
+                  height: img.height,
+                  url: imageUrl
+                });
+                resolveImg(img);
+              };
+
+              img.onerror = (err) => {
+                clearTimeout(timeout);
+                console.error('Background image FAILED TO LOAD with CORS:', {
+                  url: imageUrl,
+                  error: err,
+                  message: 'This is likely a CORS issue. Check S3 bucket CORS configuration.'
+                });
+                resolveImg(null);
+              };
+
+              console.log('Starting image load with crossOrigin=anonymous...');
+              img.src = imageUrl;
+            });
+
+            if (bgImage) {
+              // Calculate scaling to fit canvas
+              const scale = Math.min(
+                tempCanvas.width / bgImage.width,
+                tempCanvas.height / bgImage.height
+              );
+              const scaledWidth = bgImage.width * scale;
+              const scaledHeight = bgImage.height * scale;
+              const offsetX = (tempCanvas.width - scaledWidth) / 2;
+              const offsetY = (tempCanvas.height - scaledHeight) / 2;
+
+              ctx.drawImage(bgImage, offsetX, offsetY, scaledWidth, scaledHeight);
+              console.log('✓ Background image drawn successfully via CORS reload');
+              backgroundDrawn = true;
+            } else {
+              console.warn('⚠ Background image failed to load - using WHITE background for export');
+            }
+          } catch (bgErr) {
+            console.error('Exception while loading background image for export:', bgErr);
+          }
+        }
+
+        if (!backgroundDrawn) {
+          console.warn('⚠ No background image available - using WHITE background for export');
+        }
+
+        console.log('Drawing annotations...');
+        const objects = canvas.getObjects ? canvas.getObjects() : [];
+        console.log(`Found ${objects.length} objects on canvas`);
+
+        const annotationObjects = objects.filter(obj => obj.data?.issue);
+        console.log(`Found ${annotationObjects.length} annotation objects`);
+
+        annotationObjects.forEach((obj, index) => {
+          console.log(`Drawing annotation ${index}:`, obj.type);
+          try {
+            if (obj.type === 'rect') {
+              ctx.strokeStyle = obj.stroke;
+              ctx.lineWidth = obj.strokeWidth;
+              ctx.strokeRect(obj.left, obj.top, obj.width * (obj.scaleX || 1), obj.height * (obj.scaleY || 1));
+            } else if (obj.type === 'circle') {
+              ctx.beginPath();
+              ctx.arc(obj.left, obj.top, obj.radius, 0, 2 * Math.PI);
+              ctx.strokeStyle = obj.stroke;
+              ctx.lineWidth = obj.strokeWidth;
+              ctx.stroke();
+            } else if (obj.type === 'line') {
+              ctx.beginPath();
+              ctx.moveTo(obj.x1, obj.y1);
+              ctx.lineTo(obj.x2, obj.y2);
+              ctx.strokeStyle = obj.stroke;
+              ctx.lineWidth = obj.strokeWidth;
+              ctx.stroke();
+            } else if (obj.type === 'path') {
+              console.log('Drawing freehand path...');
+              ctx.strokeStyle = obj.stroke;
+              ctx.lineWidth = obj.strokeWidth || 2;
+              ctx.lineCap = 'round';
+              ctx.lineJoin = 'round';
+
+              if (obj.path && obj.path.length > 0) {
+                ctx.beginPath();
+                obj.path.forEach((point) => {
+                  const command = point[0];
+                  if (command === 'M') {
+                    ctx.moveTo(point[1] + (obj.left || 0), point[2] + (obj.top || 0));
+                  } else if (command === 'L') {
+                    ctx.lineTo(point[1] + (obj.left || 0), point[2] + (obj.top || 0));
+                  } else if (command === 'Q') {
+                    ctx.quadraticCurveTo(
+                      point[1] + (obj.left || 0), point[2] + (obj.top || 0),
+                      point[3] + (obj.left || 0), point[4] + (obj.top || 0)
+                    );
+                  }
+                });
+                ctx.stroke();
+              }
+            }
+          } catch (drawErr) {
+            console.error('Error drawing annotation:', drawErr);
+          }
+        });
+
+        console.log('Converting to data URL...');
         const dataUrl = tempCanvas.toDataURL('image/jpeg', 0.8);
+        console.log('Compression successful, data URL length:', dataUrl.length);
         resolve(dataUrl);
       } catch (err) {
-        console.error('Error during image compression:', err);
-        // Fallback to original canvas if available
-        try {
-          if (canvas && canvas.toDataURL) {
-            resolve(canvas.toDataURL('image/jpeg', 0.8));
-          } else {
-            resolve(null);
-          }
-        } catch (e) {
-          console.error('Fallback compression failed:', e);
-          resolve(null);
-        }
+        console.error('Error during image compression:', err, err.stack);
+        resolve(null);
       }
     });
   };
@@ -504,7 +583,7 @@ const AnnotationCanvas = ({
       // Get all objects except the background image
       const objects = canvas.getObjects();
       const annotations = objects.filter(obj => obj.data?.issue);
-      
+
       if (annotations.length === 0) {
         throw new Error('Please add at least one annotation');
       }
@@ -556,86 +635,144 @@ const AnnotationCanvas = ({
     }
   };
 
+  // Responsive scaling logic
+  const containerRef = useRef(null);
+  const [scale, setScale] = useState(1);
+
+  useEffect(() => {
+    const updateScale = () => {
+      if (containerRef.current) {
+        const parentWidth = containerRef.current.offsetWidth;
+        // Calculate scale needed to fit canvas into parent width
+        // Cap scale at 1 (don't scale up, only down) to prevent blurriness
+        // Default to 1 if parentWidth is 0 to avoid hiding the canvas
+        const newScale = parentWidth ? Math.min(parentWidth / canvasDimensions.width, 1) : 1;
+        setScale(newScale);
+      }
+    };
+
+    // Initial calculation
+    updateScale();
+
+    // Observe resize
+    const observer = new ResizeObserver(updateScale);
+    if (containerRef.current) {
+      observer.observe(containerRef.current);
+    }
+
+    return () => observer.disconnect();
+  }, [canvasDimensions.width]);
+
   return (
-    <div className="mb-4">
-      <canvas ref={canvasRef} className="border shadow w-full" style={{ width: '400px', height: '300px' }} />
-      {error && <p className="text-sm text-red-600 mt-2">{error}</p>}
-      
-      {/* Tool and Issue Selection */}
-      <div className="mt-4 space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-          {/* Tool Selection */}
-          <div className="space-y-1">
-            <label className="block text-sm font-medium text-gray-700">Tool</label>
-            <select
-              value={tool}
-              onChange={(e) => setTool(e.target.value)}
-              className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            >
-              <option value="rect">Rectangle</option>
-              <option value="circle">Circle</option>
-              <option value="arrow">Arrow</option>
-              <option value="freehand">Freehand</option>
-            </select>
-          </div>
-          
-          {/* Issue Selection */}
-          <div className="space-y-1">
-            <label className="block text-sm font-medium text-gray-700">Dental Issue</label>
-            <select
-              value={selectedIssue.name}
-              onChange={(e) => {
-                const issue = issues.find(i => i.name === e.target.value) || issues[0];
-                setSelectedIssue(issue);
-              }}
-              className="w-full px-3 py-2 text-sm border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
-            >
-              {issues.map((issue) => (
-                <option key={issue.name} value={issue.name}>
-                  {issue.name}
-                </option>
-              ))}
-            </select>
-          </div>
-          
-          {/* Save Button */}
-          <div className="space-y-1 flex flex-col">
-            <span className="invisible text-sm">Action</span>
-            <button
-              onClick={handleSave}
-              className={`w-full px-4 py-2 text-sm font-medium text-white rounded-md focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 transition-colors duration-200 ${
-                isSaving || isSaveDisabled
-                  ? 'bg-indigo-400 cursor-not-allowed' 
-                  : 'bg-indigo-600 hover:bg-indigo-700'
-              }`}
-              disabled={!!error || isSaving || isSaveDisabled}
-            >
-              {isSaving ? 'Saving...' : saveButtonText}
-            </button>
-          </div>
-        </div>
-        
-        {/* Color Preview */}
-        <div className="flex items-center text-sm text-gray-600 bg-gray-50 px-3 py-2 rounded-md">
-          <span className="font-medium mr-2">Selected Issue:</span>
-          <div 
-            className="w-5 h-5 rounded-full border-2 border-gray-300 shadow-sm mr-2"
-            style={{ backgroundColor: selectedIssue.color }}
-            title={selectedIssue.name}
+    <div className="bg-white dark:bg-surface/50 p-4 rounded-xl shadow-md border border-gray-100 dark:border-border-color/50 h-full flex flex-col backdrop-blur-sm">
+      {/* Canvas Section */}
+      <div
+        ref={containerRef}
+        className="bg-gradient-to-br from-gray-50 to-blue-50 dark:from-slate-800 dark:to-slate-900 p-3 rounded-lg border border-gray-200 dark:border-slate-700 mb-4 flex-grow flex items-center justify-center overflow-hidden relative"
+        style={{ minHeight: `${canvasDimensions.height * scale + 24}px` }} // Reserve height based on scale + padding
+      >
+        <div
+          style={{
+            transform: `scale(${scale})`,
+            transformOrigin: 'center center',
+            width: `${canvasDimensions.width}px`,
+            height: `${canvasDimensions.height}px`,
+            flexShrink: 0
+          }}
+        >
+          <canvas
+            ref={canvasRef}
+            className="border-2 border-blue-100 dark:border-slate-600 rounded shadow-sm block"
+            width={canvasDimensions.width}
+            height={canvasDimensions.height}
           />
-          <span className="font-medium">{selectedIssue.name}</span>
-          <span className="mx-2 text-gray-400">|</span>
-          <span className="text-gray-500">
-            {selectedIssue.recommendation}
-          </span>
         </div>
-        
-        <p className="text-xs text-gray-500">
-          <span className="font-medium">Tip:</span> Use at least 2 different issue types for a comprehensive report.
-        </p>
+      </div>
+
+      {error && (
+        <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg">
+          <p className="text-sm text-red-700 dark:text-red-300 font-medium flex items-center">
+            <span className="mr-2">⚠️</span>
+            {error}
+          </p>
+        </div>
+      )}
+
+      {/* Clinical Controls Section */}
+      <div className="space-y-4">
+        {/* Control Grid */}
+        <div className="grid grid-cols-1 gap-3">
+          <div className="grid grid-cols-2 gap-3">
+            {/* Drawing Tool */}
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 dark:text-text-secondary uppercase tracking-wider">
+                Tool
+              </label>
+              <select
+                value={tool}
+                onChange={(e) => setTool(e.target.value)}
+                className="w-full px-2 py-2 text-sm font-medium border border-gray-300 dark:border-slate-600 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-slate-800 text-gray-900 dark:text-white"
+              >
+                <option value="rect">Rectangle</option>
+                <option value="circle">Circle</option>
+                <option value="arrow">Arrow</option>
+                <option value="freehand">Freehand</option>
+              </select>
+            </div>
+
+            {/* Clinical Issue */}
+            <div className="space-y-1">
+              <label className="block text-[10px] font-bold text-gray-500 dark:text-text-secondary uppercase tracking-wider">
+                Finding
+              </label>
+              <select
+                value={selectedIssue.name}
+                onChange={(e) => {
+                  const issue = issues.find(i => i.name === e.target.value) || issues[0];
+                  setSelectedIssue(issue);
+                }}
+                className="w-full px-2 py-2 text-sm font-medium border border-gray-300 dark:border-slate-600 rounded-md shadow-sm focus:outline-none focus:ring-1 focus:ring-blue-500 focus:border-blue-500 bg-white dark:bg-slate-800 text-gray-900 dark:text-white"
+              >
+                {issues.map((issue) => (
+                  <option key={issue.name} value={issue.name}>
+                    {issue.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Save Button */}
+          <button
+            onClick={handleSave}
+            className={`w-full px-4 py-2.5 text-sm font-bold rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-1 focus:ring-blue-600 transition-all duration-200 ${isSaving || isSaveDisabled
+              ? 'bg-gray-100 dark:bg-slate-800 text-gray-400 dark:text-slate-500 cursor-not-allowed border border-gray-200 dark:border-slate-700'
+              : 'bg-blue-600 text-white hover:bg-blue-700 hover:shadow-md'
+              }`}
+            disabled={!!error || isSaving || isSaveDisabled}
+          >
+            {isSaving ? 'Saving...' : 'Save'}
+          </button>
+        </div>
+
+        {/* Clinical Observation Summary */}
+        <div className="bg-blue-50/50 dark:bg-slate-800/50 px-3 py-2 rounded border border-blue-100 dark:border-slate-700 flex items-center">
+          <div
+            className="w-4 h-4 rounded border border-gray-300 dark:border-slate-600 shadow-sm mr-2 flex-shrink-0"
+            style={{ backgroundColor: selectedIssue.color }}
+          />
+          <div className="min-w-0">
+            <p className="text-xs font-bold text-gray-800 dark:text-white truncate">
+              {selectedIssue.name}
+            </p>
+            <p className="text-[10px] text-gray-500 dark:text-slate-400 truncate">
+              {selectedIssue.recommendation}
+            </p>
+          </div>
+        </div>
       </div>
     </div>
-  )
+  );
 };
 
 export default AnnotationCanvas;

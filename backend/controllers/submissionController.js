@@ -1,4 +1,5 @@
 const Submission = require('../models/Submission');
+const User = require('../models/User');
 const { uploadToS3 } = require('../config/s3');
 const { v4: uuidv4 } = require('uuid');
 const PDFDocument = require('pdfkit');
@@ -47,14 +48,14 @@ const generatePDFContent = async (doc, submission, usedColors) => {
   // Header
   doc.rect(0, 0, doc.page.width, 80).fill(colors.header);
   doc.fillColor(colors.headerText)
-     .fontSize(24)
-     .text('Oral Health Screening Report', 0, 25, { align: 'center', width: doc.page.width });
+    .fontSize(24)
+    .text('Oral Health Screening Report', 0, 25, { align: 'center', width: doc.page.width });
 
   // Patient info
   let y = 100;
   doc.fillColor(colors.text)
-     .fontSize(12)
-     .text(`Name: ${submission.name}`, 50, y);
+    .fontSize(12)
+    .text(`Name: ${submission.name}`, 50, y);
   doc.text(`Phone: ${submission.phone || 'N/A'}`, 200, y);
   doc.text(`Date: ${new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: '2-digit' })}`, 400, y);
   y += 30;
@@ -78,9 +79,9 @@ const generatePDFContent = async (doc, submission, usedColors) => {
   const right = mid + imgWidth + 10;
 
   const imagePositions = [
-    { url: submission.upperAnnotatedUrl, x: left, label: 'Upper Teeth' },
-    { url: submission.frontAnnotatedUrl, x: mid, label: 'Front Teeth' },
-    { url: submission.lowerAnnotatedUrl, x: right, label: 'Lower Teeth' },
+    { url: submission.annotatedUpperUrl, x: left, label: 'Upper Teeth' },
+    { url: submission.annotatedFrontUrl, x: mid, label: 'Front Teeth' },
+    { url: submission.annotatedLowerUrl, x: right, label: 'Lower Teeth' },
   ];
 
   for (const { url, x, label } of imagePositions) {
@@ -104,8 +105,8 @@ const generatePDFContent = async (doc, submission, usedColors) => {
   for (const { x, label } of imagePositions) {
     doc.roundedRect(x, labelY, imgWidth, labelH, labelR).fill(colors.labelBg);
     doc.fillColor(colors.labelText)
-       .fontSize(12)
-       .text(label, x, labelY + 5, { align: 'center', width: imgWidth });
+      .fontSize(12)
+      .text(label, x, labelY + 5, { align: 'center', width: imgWidth });
   }
 
   y += boxH + 30;
@@ -124,6 +125,16 @@ const generatePDFContent = async (doc, submission, usedColors) => {
 
   y += legendH + 40;
 
+  // Doctor's Notes (if present)
+  if (submission.doctorNotes) {
+    doc.fontSize(16).fillColor(colors.subtitle).text('Doctor\'s Remarks:', 50, y);
+    y += 25;
+    doc.fontSize(12).fillColor(colors.text);
+    const notesText = submission.doctorNotes;
+    doc.text(notesText, 50, y, { width: doc.page.width - 100 });
+    y += doc.heightOfString(notesText, { width: doc.page.width - 100 }) + 30;
+  }
+
   // Treatment Recommendations
   doc.fontSize(16).fillColor(colors.subtitle).text('Treatment Recommendations:', 50, y);
   y += 25;
@@ -138,19 +149,35 @@ const generatePDFContent = async (doc, submission, usedColors) => {
 };
 
 const createSubmission = async (req, res) => {
-  const { name, patientID, email, phone, note } = req.body;
+  const { title, name, patientID, email, phone, note } = req.body;
   const files = req.files;
 
-  if (!name || !patientID || !email) {
-    return res.status(400).json({ msg: 'Name, patientID, and email are required' });
+  if (!title || !name || !patientID || !email) {
+    return res.status(400).json({ msg: 'Title, name, patientID, and email are required' });
   }
 
   if (!files || !files.upper || !files.front || !files.lower) {
     return res.status(400).json({ msg: 'All three images (upper, front, lower) are required' });
   }
 
-  if (!files.upper[0]?.buffer || !files.front[0]?.buffer || !files.lower[0]?.buffer) {
-    return res.status(400).json({ msg: 'Invalid file data: missing buffer' });
+  // Check if files are in the expected format (single file upload)
+  const upperFile = Array.isArray(files.upper) ? files.upper[0] : files.upper;
+  const frontFile = Array.isArray(files.front) ? files.front[0] : files.front;
+  const lowerFile = Array.isArray(files.lower) ? files.lower[0] : files.lower;
+
+  if (!upperFile?.buffer || !frontFile?.buffer || !lowerFile?.buffer) {
+    return res.status(400).json({
+      msg: 'Invalid file data: missing buffer',
+      receivedFiles: {
+        upper: !!files.upper,
+        front: !!files.front,
+        lower: !!files.lower,
+        upperBuffer: !!upperFile?.buffer,
+        frontBuffer: !!frontFile?.buffer,
+        lowerBuffer: !!lowerFile?.buffer,
+        filesStructure: Object.keys(files)
+      }
+    });
   }
 
   try {
@@ -159,13 +186,14 @@ const createSubmission = async (req, res) => {
     const lowerKey = `images/original/${uuidv4()}.png`;
 
     const [upperUrl, frontUrl, lowerUrl] = await Promise.all([
-      uploadToS3(files.upper[0].buffer, upperKey, 'image/png'),
-      uploadToS3(files.front[0].buffer, frontKey, 'image/png'),
-      uploadToS3(files.lower[0].buffer, lowerKey, 'image/png'),
+      uploadToS3(upperFile.buffer, upperKey, 'image/png'),
+      uploadToS3(frontFile.buffer, frontKey, 'image/png'),
+      uploadToS3(lowerFile.buffer, lowerKey, 'image/png'),
     ]);
 
     const submission = new Submission({
       userId: req.user.id,
+      title,
       name,
       patientID,
       email,
@@ -192,8 +220,46 @@ const createSubmission = async (req, res) => {
 
 const getOwnSubmissions = async (req, res) => {
   try {
-    const submissions = await Submission.find({ userId: req.user.id });
-    res.json(submissions);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const total = await Submission.countDocuments({ userId: req.user.id });
+    const pages = Math.ceil(total / limit);
+
+    const submissions = await Submission.find(
+      { userId: req.user.id },
+      {
+        status: 1,
+        name: 1,
+        title: 1,
+        patientID: 1,
+        uploadDate: 1,
+        updatedAt: 1,
+        phone: 1,
+        note: 1
+      }
+    )
+      .sort({ uploadDate: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+      .exec();
+
+    // Convert dates to ISO strings for proper serialization
+    const formattedSubmissions = submissions.map(submission => ({
+      ...submission,
+      uploadDate: submission.uploadDate ? new Date(submission.uploadDate).toISOString() : null,
+      updatedAt: submission.updatedAt ? new Date(submission.updatedAt).toISOString() : null,
+      createdAt: submission.createdAt ? new Date(submission.createdAt).toISOString() : null
+    }));
+
+    res.json({
+      submissions: formattedSubmissions,
+      page,
+      pages,
+      total
+    });
   } catch (err) {
     console.error('Get own submissions error:', { message: err.message });
     res.status(500).json({ msg: `Failed to fetch submissions: ${err.message}` });
@@ -202,8 +268,48 @@ const getOwnSubmissions = async (req, res) => {
 
 const getAllSubmissions = async (req, res) => {
   try {
-    const submissions = await Submission.find();
-    res.json(submissions);
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 10;
+    const skip = (page - 1) * limit;
+
+    const total = await Submission.countDocuments({});
+    const pages = Math.ceil(total / limit);
+
+    const submissions = await Submission.find(
+      {},
+      {
+        status: 1,
+        name: 1,
+        title: 1,
+        patientID: 1,
+        uploadDate: 1,
+        updatedAt: 1,
+        phone: 1,
+        note: 1,
+        reportUrl: 1,
+        userId: 1
+      }
+    )
+      .sort({ uploadDate: -1 })
+      .skip(skip)
+      .limit(limit)
+      .lean()
+      .exec();
+
+    // Convert dates to ISO strings for proper serialization
+    const formattedSubmissions = submissions.map(submission => ({
+      ...submission,
+      uploadDate: submission.uploadDate ? new Date(submission.uploadDate).toISOString() : null,
+      updatedAt: submission.updatedAt ? new Date(submission.updatedAt).toISOString() : null,
+      createdAt: submission.createdAt ? new Date(submission.createdAt).toISOString() : null
+    }));
+
+    res.json({
+      submissions: formattedSubmissions,
+      page,
+      pages,
+      total
+    });
   } catch (err) {
     console.error('Get all submissions error:', { message: err.message });
     res.status(500).json({ msg: `Failed to fetch submissions: ${err.message}` });
@@ -228,7 +334,7 @@ const getSubmissionById = async (req, res) => {
 
 const saveAnnotations = async (req, res) => {
   try {
-    const { upperAnnotations, frontAnnotations, lowerAnnotations, upperBase64, frontBase64, lowerBase64 } = req.body;
+    const { upperAnnotations, frontAnnotations, lowerAnnotations, upperBase64, frontBase64, lowerBase64, doctorNotes } = req.body;
 
     console.log('Received annotations payload:', {
       id: req.params.id,
@@ -269,33 +375,34 @@ const saveAnnotations = async (req, res) => {
     if (upperBase64) {
       const upperKey = `images/annotated/${uuidv4()}.jpg`;
       uploads.push(uploadToS3(validateBase64(upperBase64), upperKey, 'image/jpeg')
-        .then(url => submission.upperAnnotatedUrl = url));
+        .then(url => submission.annotatedUpperUrl = url));
     }
     if (frontBase64) {
       const frontKey = `images/annotated/${uuidv4()}.jpg`;
       uploads.push(uploadToS3(validateBase64(frontBase64), frontKey, 'image/jpeg')
-        .then(url => submission.frontAnnotatedUrl = url));
+        .then(url => submission.annotatedFrontUrl = url));
     }
     if (lowerBase64) {
       const lowerKey = `images/annotated/${uuidv4()}.jpg`;
       uploads.push(uploadToS3(validateBase64(lowerBase64), lowerKey, 'image/jpeg')
-        .then(url => submission.lowerAnnotatedUrl = url));
+        .then(url => submission.annotatedLowerUrl = url));
     }
 
     await Promise.all(uploads);
 
-    // Update annotations and status
+    // Update annotations, doctor notes, and status
     submission.upperAnnotations = upperAnnotations || null;
     submission.frontAnnotations = frontAnnotations || null;
     submission.lowerAnnotations = lowerAnnotations || null;
+    submission.doctorNotes = doctorNotes || null;
     submission.status = 'annotated';
     await submission.save();
 
     console.log('Annotations saved successfully:', {
       id: submission._id,
-      upperUrl: submission.upperAnnotatedUrl,
-      frontUrl: submission.frontAnnotatedUrl,
-      lowerUrl: submission.lowerAnnotatedUrl,
+      upperUrl: submission.annotatedUpperUrl,
+      frontUrl: submission.annotatedFrontUrl,
+      lowerUrl: submission.annotatedLowerUrl,
     });
 
     // Check unique issue types
@@ -308,13 +415,7 @@ const saveAnnotations = async (req, res) => {
       }
     });
 
-    if (usedColors.size < 2) {
-      return res.json({
-        ...submission.toObject(),
-        pdfStatus: 'requires_more_annotations',
-        requiredAnnotations: Math.max(0, 2 - usedColors.size)
-      });
-    }
+    // Removed minimum annotation requirement - now allows saving with any number of annotations
 
     // Generate PDF
     const doc = new PDFDocument({ margin: 50 });
@@ -370,9 +471,7 @@ const generatePDF = async (req, res) => {
       }
     });
 
-    if (usedColors.size < 2) {
-      return res.status(400).json({ msg: 'At least two different issue types are required for PDF generation' });
-    }
+    // Removed minimum annotation requirement - now allows PDF generation with any number of annotations
 
     const doc = new PDFDocument({ margin: 50 });
     const buffers = [];
@@ -408,6 +507,189 @@ const generatePDF = async (req, res) => {
   }
 };
 
+const requestResubmission = async (req, res) => {
+  try {
+    const { resubmissionReason } = req.body;
+
+    if (!resubmissionReason) {
+      return res.status(400).json({ msg: 'Resubmission reason is required' });
+    }
+
+    const submission = await Submission.findById(req.params.id);
+    if (!submission) {
+      return res.status(404).json({ msg: 'Submission not found' });
+    }
+
+    submission.status = 'request_resubmission';
+    submission.resubmissionReason = resubmissionReason;
+    await submission.save();
+
+    console.log('Resubmission requested:', { id: submission._id, reason: resubmissionReason });
+    res.json({ msg: 'Resubmission requested successfully', submission });
+  } catch (err) {
+    console.error('Request resubmission error:', {
+      message: err.message,
+      code: err.code,
+      name: err.name,
+    });
+    res.status(500).json({ msg: `Failed to request resubmission: ${err.message}` });
+  }
+};
+
+const reuploadImages = async (req, res) => {
+  const files = req.files;
+
+  if (!files || !files.upper || !files.front || !files.lower) {
+    return res.status(400).json({ msg: 'All three images (upper, front, lower) are required' });
+  }
+
+  const upperFile = Array.isArray(files.upper) ? files.upper[0] : files.upper;
+  const frontFile = Array.isArray(files.front) ? files.front[0] : files.front;
+  const lowerFile = Array.isArray(files.lower) ? files.lower[0] : files.lower;
+
+  if (!upperFile?.buffer || !frontFile?.buffer || !lowerFile?.buffer) {
+    return res.status(400).json({ msg: 'Invalid file data: missing buffer' });
+  }
+
+  try {
+    const submission = await Submission.findById(req.params.id);
+    if (!submission) {
+      return res.status(404).json({ msg: 'Submission not found' });
+    }
+
+    // Verify user owns this submission
+    if (submission.userId.toString() !== req.user.id) {
+      return res.status(403).json({ msg: 'Unauthorized' });
+    }
+
+    const upperKey = `images/original/${uuidv4()}.png`;
+    const frontKey = `images/original/${uuidv4()}.png`;
+    const lowerKey = `images/original/${uuidv4()}.png`;
+
+    const [upperUrl, frontUrl, lowerUrl] = await Promise.all([
+      uploadToS3(upperFile.buffer, upperKey, 'image/png'),
+      uploadToS3(frontFile.buffer, frontKey, 'image/png'),
+      uploadToS3(lowerFile.buffer, lowerKey, 'image/png'),
+    ]);
+
+    // Update submission with new images and reset status
+    submission.originalUpperUrl = upperUrl;
+    submission.originalFrontUrl = frontUrl;
+    submission.originalLowerUrl = lowerUrl;
+    submission.status = 'uploaded';
+    submission.resubmissionReason = null;
+    // Clear previous annotations and annotated images
+    submission.annotatedUpperUrl = null;
+    submission.annotatedFrontUrl = null;
+    submission.annotatedLowerUrl = null;
+    submission.upperAnnotations = null;
+    submission.frontAnnotations = null;
+    submission.lowerAnnotations = null;
+    submission.reportUrl = null;
+
+    await submission.save();
+
+    console.log('Images reuploaded successfully:', { id: submission._id });
+    res.json(submission);
+  } catch (err) {
+    console.error('Reupload images error:', {
+      message: err.message,
+      code: err.code,
+      name: err.name,
+    });
+    res.status(500).json({ msg: `Failed to reupload images: ${err.message}` });
+  }
+};
+
+const addMessage = async (req, res) => {
+  try {
+    const { message, sender } = req.body;
+
+    if (!message || !sender) {
+      return res.status(400).json({ msg: 'Message and sender are required' });
+    }
+
+    const submission = await Submission.findById(req.params.id);
+    if (!submission) {
+      return res.status(404).json({ msg: 'Submission not found' });
+    }
+
+    // Add message to the messages array
+    submission.messages.push({
+      sender,
+      message,
+      timestamp: new Date()
+    });
+
+    await submission.save();
+
+    console.log('Message added:', { id: submission._id, sender });
+    res.json(submission);
+  } catch (err) {
+    console.error('Add message error:', {
+      message: err.message,
+      code: err.code,
+      name: err.name,
+    });
+    res.status(500).json({ msg: `Failed to add message: ${err.message}` });
+  }
+};
+
+
+
+const getDashboardStats = async (req, res) => {
+  try {
+    const [
+      totalPatients,
+      totalSubmissions,
+      uploadedCount,
+      annotatedCount,
+      reportedCount
+    ] = await Promise.all([
+      User.countDocuments({ role: 'patient' }),
+      Submission.countDocuments({}),
+      Submission.countDocuments({ status: 'uploaded' }),
+      Submission.countDocuments({ status: 'annotated' }),
+      Submission.countDocuments({ status: 'reported' })
+    ]);
+
+    res.json({
+      totalPatients,
+      totalSubmissions,
+      uploaded: uploadedCount,
+      annotated: annotatedCount,
+      reported: reportedCount
+    });
+  } catch (err) {
+    console.error('Get dashboard stats error:', { message: err.message });
+    res.status(500).json({ msg: `Failed to fetch dashboard stats: ${err.message}` });
+  }
+};
+
+const getPatientStats = async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const [
+      total,
+      inReview,
+      completed
+    ] = await Promise.all([
+      Submission.countDocuments({ userId }),
+      Submission.countDocuments({ userId, status: { $in: ['pending', 'processing', 'uploaded', 'request_resubmission'] } }),
+      Submission.countDocuments({ userId, status: { $in: ['completed', 'reported'] } })
+    ]);
+
+    res.json({
+      total,
+      inReview,
+      completed
+    });
+  } catch (err) {
+    console.error('Get patient stats error:', { message: err.message });
+    res.status(500).json({ msg: `Failed to fetch patient stats: ${err.message}` });
+  }
+};
+
 module.exports = {
   createSubmission,
   getOwnSubmissions,
@@ -415,4 +697,9 @@ module.exports = {
   getSubmissionById,
   saveAnnotations,
   generatePDF,
+  requestResubmission,
+  reuploadImages,
+  addMessage,
+  getDashboardStats,
+  getPatientStats,
 };

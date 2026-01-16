@@ -24,6 +24,7 @@ const cors = require('cors');
 const connectDB = require('./config/db');
 const authRoutes = require('./routes/auth');
 const submissionRoutes = require('./routes/submissions');
+const userRoutes = require('./routes/users');
 
 const app = express();
 
@@ -70,6 +71,7 @@ app.use(express.json({ limit: MAX_BODY_SIZE }));
 app.use(express.urlencoded({ limit: MAX_BODY_SIZE, extended: true }));
 app.use('/api/auth', authRoutes);
 app.use('/api/submissions', submissionRoutes);
+app.use('/api/users', userRoutes);
 
 // Global error handler
 app.use((err, req, res, next) => {

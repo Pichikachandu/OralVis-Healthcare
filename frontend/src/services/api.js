@@ -3,6 +3,7 @@ import axios from 'axios';
 const api = axios.create({
   baseURL: 'http://localhost:5000/api',
   headers: { 'Content-Type': 'application/json' },
+  timeout: 180000, // 3 minutes for annotation saves with image processing
 });
 
 api.interceptors.request.use(config => {
